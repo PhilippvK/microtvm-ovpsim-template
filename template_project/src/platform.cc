@@ -36,10 +36,10 @@
 // #include <chrono>
 #include <iostream>
 
-#ifndef SPIKE_CPU_FREQ_HZ
+#ifndef OVPSIM_CPU_FREQ_HZ
 // Default: 100MHz
-#define SPIKE_CPU_FREQ_HZ (100000000)
-#endif  // SPIKE_CPU_FREQ_HZ
+#define OVPSIM_CPU_FREQ_HZ (100000000)
+#endif  // OVPSIM_CPU_FREQ_HZ
 
 
 /**
@@ -137,7 +137,7 @@ tvm_crt_error_t TVMPlatformTimerStop(double* elapsed_time_seconds) {
   // *elapsed_time_seconds = static_cast<double>(time_span.count()) / 1e6;
   // *elapsed_time_seconds = 0.042;
   uint64_t microtvm_stop_time = rdcycle64();
-  *elapsed_time_seconds = (microtvm_stop_time - g_microtvm_start_time) / (float)(SPIKE_CPU_FREQ_HZ);
+  *elapsed_time_seconds = (microtvm_stop_time - g_microtvm_start_time) / (float)(OVPSIM_CPU_FREQ_HZ);
   // TVMLogf("delta: %f\n", *elapsed_time_seconds);
   g_microtvm_timer_running = 0;
   return kTvmErrorNoError;

@@ -28,6 +28,9 @@
 #include <tvm/runtime/crt/microtvm_rpc_server.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #include <iostream>
 
 #include "crt_config.h"
@@ -36,7 +39,7 @@
 #include <tvm/runtime/crt/graph_executor_module.h>
 #endif
 
-// #define DBG
+#define DBG
 #ifdef DBG
 FILE *fp;
 #define dbginit() fp = fopen("/tmp/test.txt", "w+");
@@ -51,7 +54,14 @@ FILE *fp;
 extern "C" {
 
 ssize_t MicroTVMWriteFunc(void* context, const uint8_t* data, size_t num_bytes) {
-  ssize_t to_return = write(STDOUT_FILENO, data, num_bytes);
+  dbgprintf("write %lu\n", num_bytes);
+  for (size_t i=0; i<num_bytes; i++) {
+    dbgprintf("%lu: %u [%c]\n", i, data[i], data[i]);
+    printf("%c", data[i]);
+  }
+  // ssize_t to_return = write(STDOUT_FILENO, data, num_bytes);
+  ssize_t to_return = num_bytes;
+  dbgprintf("to_ret %ld\n", to_return);
   fflush(stdout);
   // fsync(STDOUT_FILENO);
   return to_return;
@@ -68,6 +78,8 @@ static char** g_argv = NULL;
 }*/
 
 int main(int argc, char** argv) {
+  dbginit();
+  dbgprintf("AA\n");
   g_argv = argv;
   TVMPlatformInitialize();
   microtvm_rpc_server_t rpc_server = MicroTVMRpcServerInit(&MicroTVMWriteFunc, nullptr);
@@ -76,6 +88,7 @@ int main(int argc, char** argv) {
   CHECK_EQ(TVMGraphExecutorModule_Register(), kTvmErrorNoError,
            "failed to register GraphExecutor TVMModule");
 #endif
+  dbgprintf("BB\n");
 
   // int error = TVMFuncRegisterGlobal("tvm.testing.reset_server",
   //                                   (TVMFunctionHandle)&testonly_reset_server, 0);
@@ -87,14 +100,19 @@ int main(int argc, char** argv) {
   //   return 2;
   // }
 
+  dbgprintf("CC\n");
   setbuf(stdin, NULL);
   setbuf(stdout, NULL);
-  TVMLogf("microTVM SPIKE runtime - running");
+  TVMLogf("microTVM OVPSim runtime - running");
+  dbgprintf("DD\n");
 
-  dbginit();
   for (;;) {
+    dbgprintf("loop\n");
+    char * myfifo = "/tmp/fifo.in";
+    int fd1 = open(myfifo, O_RDONLY);
     uint8_t c;
-    int ret_code = read(STDIN_FILENO, &c, 1);
+    // int ret_code = read(STDIN_FILENO, &c, 1);
+    int ret_code = read(fd1, &c, 1);
     if (ret_code < 0) {
       TVMLogf("?Ret222?\n");
       perror("microTVM runtime: read failed");
@@ -104,7 +122,7 @@ int main(int argc, char** argv) {
       fprintf(stderr, "microTVM runtime: 0-length read, exiting!\n");
       return 2;
     }
-    // printf("c=%c, r=%d\n", c, ret_code);
+    dbgprintf("c=%c, r=%d\n", c, ret_code);
     // continue;
     uint8_t* cursor = &c;
     size_t bytes_to_process = 1;

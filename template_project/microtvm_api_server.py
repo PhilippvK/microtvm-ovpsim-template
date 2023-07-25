@@ -28,14 +28,16 @@ import subprocess
 import tarfile
 import time
 import distutils.util
+import queue
+import threading
 
 from tvm.micro.project_api import server
 
 _LOG = logging.getLogger(__name__)
-_LOG.setLevel(logging.WARNING)
+_LOG.setLevel(logging.DEBUG)
 
-SPIKE_EXE = "spike"
-SPIKE_PK = "pk"
+OVPSIM_EXE = "riscvOVPsimCOREV.exe"
+# OVPSIM_EXE = "riscvOVPsimPlus.exe"
 
 PROJECT_DIR = pathlib.Path(os.path.dirname(__file__) or os.path.getcwd())
 
@@ -59,8 +61,6 @@ ABI = "ilp32d"
 TRIPLE = "riscv32-unknown-elf"
 TOOLCHAIN = "gcc"
 NPROC = multiprocessing.cpu_count()
-VLEN = 128
-ELEN = 64
 
 
 def str2bool(value, allow_none=False):
@@ -82,6 +82,10 @@ class Handler(server.ProjectAPIHandler):
     def __init__(self):
         super(Handler, self).__init__()
         self._proc = None
+        self._queue = queue.Queue()
+        self.pipe_dir = None
+        self.read_fd = None
+        self.write_fd = None
 
     def server_info_query(self, tvm_version):
         return server.ServerInfo(
@@ -134,20 +138,6 @@ class Handler(server.ProjectAPIHandler):
                     help="Name used ABI.",
                 ),
                 server.ProjectOption(
-                    "vlen",
-                    optional=["open_transport"],
-                    default=VLEN,
-                    type="int",
-                    help="VLEN used if V-Extension is available.",
-                ),
-                server.ProjectOption(
-                    "elen",
-                    optional=["open_transport"],
-                    default=ELEN,
-                    type="int",
-                    help="ELEN used if V-Extension is available.",
-                ),
-                server.ProjectOption(
                     "toolchain",
                     optional=["build"],
                     default=TOOLCHAIN,
@@ -177,32 +167,18 @@ class Handler(server.ProjectAPIHandler):
                     help="Name used COMPILER.",
                 ),
                 server.ProjectOption(
-                    "spike_exe",
-                    required=(["open_transport"] if not SPIKE_EXE else None),
-                    optional=(["open_transport"] if SPIKE_EXE else []),
-                    default=SPIKE_EXE,
+                    "ovpsim_exe",
+                    required=(["open_transport"] if not OVPSIM_EXE else None),
+                    optional=(["open_transport"] if OVPSIM_EXE else []),
+                    default=OVPSIM_EXE,
                     type="str",
-                    help="Path to the spike (riscv-isa-sim) executable.",
+                    help="Path to the OVPSim executable.",
                 ),
                 server.ProjectOption(
-                    "spike_pk",
-                    required=(["open_transport"] if not SPIKE_PK else None),
-                    optional=(["open_transport"] if SPIKE_PK else None),
-                    default=SPIKE_EXE,
-                    type="str",
-                    help="Path to the proxy-kernel (pk).",
-                ),
-                server.ProjectOption(
-                    "spike_extra_args",
+                    "ovpsim_extra_args",
                     optional=["open_transport"],
                     type="str",
-                    help="Additional arguments added to the spike command line.",
-                ),
-                server.ProjectOption(
-                    "pk_extra_args",
-                    optional=["open_transport"],
-                    type="str",
-                    help="Additional arguments added to the pk command line.",
+                    help="Additional arguments added to the ovpsim command line.",
                 ),
             ],
         )
@@ -324,40 +300,115 @@ class Handler(server.ProjectAPIHandler):
         assert (new_flag & os.O_NONBLOCK) != 0, "Cannot set file descriptor {fd} to non-blocking"
 
     def open_transport(self, options):
-        # print("open_transport")
+        print("open_transport")
         isa = options.get("arch", ARCH)
         if isa is None:
             isa = ARCH
-        spike_extra = options.get("spike_extra_args")
-        if spike_extra in [None, ""]:
-            spike_extra = []
+        ovpsim_extra = options.get("ovpsim_extra_args")
+        if ovpsim_extra in [None, ""]:
+            ovpsim_extra = []
         else:
-            spike_extra = [spike_extra]
-        vlen = int(options.get("vlen", VLEN))
-        if vlen > 0:
-            elen = int(options.get("elen", ELEN))
-            assert vlen >= 128, "VLEN has to be >= 128"
-            assert elen in [32, 64], "ELEN has to be either 32 or 64"
-            spike_extra.append(f"--varch=vlen:{vlen},elen:{elen}")
-        pk_extra = options.get("pk_extra_args")
-        if pk_extra in [None, ""]:
-            pk_extra = []
+            ovpsim_extra = [ovpsim_extra]
+        ovpsim_args = [options.get("ovpsim_exe")]
+        if True:
+            ovpsim_args.extend(["--variant", "CV32E40P"])
         else:
-            pk_extra = [pk_extra]
-        spike_args = [options.get("spike_exe"), f"--isa={isa}", *spike_extra, options.get("spike_pk"), *pk_extra]
+            ovpsim_args.extend(["--variant", "RV32I"])
+        if True:
+            ovpsim_args.extend(["--processorname", "CVE4P"])
+        else:
+            pass
+        if True:
+            ovpsim_args.extend(["--override", "riscvOVPsim/cpu/extension_CVE4P/mcountinhibit_reset=0"])
+        else:
+            pass
+        ovpsim_args.extend(["--override", "riscvOVPsim/cpu/add_Extensions=MC"])  # TODO: fpu!
+        ovpsim_args.extend(["--override", "riscvOVPsim/cpu/unaligned=T"])
+        ovpsim_args.extend(["--override", "riscvOVPsim/cpu/pk/reportExitErrors=T"])
+        ovpsim_args.extend(["--finishonopcode", "0"])
+        ovpsim_args.extend(["--program", self.BUILD_TARGET])
+        ovpsim_args.extend(ovpsim_extra)
+
+        print("PROJECT_DIR", PROJECT_DIR)
+        print("args", ovpsim_args)
+        print("00")
+        self.pipe_dir = pathlib.Path("/tmp")
+        print("11")
+        self.write_pipe = self.pipe_dir / "fifo.in"
+        print("22")
+        self.read_pipe = self.pipe_dir / "fifo.out"
+        print("33")
+        try:
+            os.mkfifo(self.write_pipe)
+        except:
+            print("eee")
+            time.sleep(60)
+        print("44")
+        os.mkfifo(self.read_pipe)
+        print("55")
+        self.read_fd = os.open(self.read_pipe, os.O_RDWR | os.O_NONBLOCK)
+        print("66")
+        self.write_fd = os.open(self.write_pipe, os.O_RDWR | os.O_NONBLOCK)
+        print("77")
+        # try:
+        #     _set_nonblock(self.read_fd)
+        # except:
+        #     print("fff")
+        #     time.sleep(60)
+        # print("88")
+        # _set_nonblock(self.write_fd)
+        input(">>")
+        print("A")
         self._proc = subprocess.Popen(
-            spike_args + [self.BUILD_TARGET], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+            ovpsim_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
         )
-        self._set_nonblock(self._proc.stdin.fileno())
-        self._set_nonblock(self._proc.stdout.fileno())
+        print("B")
+        print("C")
+        print("X")
+        # self._set_nonblock(self._proc.stdin.fileno())
+        # self._set_nonblock(self._proc.stdout.fileno())
+        print("Y")
+        threading.Thread(target=self._fvp_check_stdout, daemon=True).start()
+        print("Z")
+        self._wait_for_fvp()
+        # self._set_nonblock(self._proc.stdin.fileno())
+        # self._set_nonblock(self._proc.stdout.fileno())
         return server.TransportTimeouts(
             session_start_retry_timeout_sec=0,
             session_start_timeout_sec=0,
             session_established_timeout_sec=0,
         )
 
+
+    def _fvp_check_stdout(self):
+        START_MSG = "Iris server started listening to port"
+        INIT_MSG = "microTVM Zephyr runtime - running"
+        for line in self._proc.stdout:
+            line = str(line, "utf-8")
+            _LOG.info("%s", line)
+            if "RW-" in line:
+                print("!!!")
+                self._queue.put(True)
+                break
+            else:
+                print("???")
+        print("end loop")
+
+    def _wait_for_fvp(self):
+        """waiting for the START_MSG to appear on the stdout"""
+        while True:
+            try:
+                item = self._queue.get(timeout=120)
+                print("item", item)
+            except Exception:
+                raise TimeoutError("FVP setup timeout.")
+
+            if item == True:
+                return
+        print("finished waiting")
+
     def close_transport(self):
-        # print("close_transport")
+        print("close_transport")
         if self._proc is not None:
             proc = self._proc
             self._proc = None
@@ -374,48 +425,64 @@ class Handler(server.ProjectAPIHandler):
 
         return True
 
+    # def read_transport(self, n, timeout_sec):
+    #     print("read_transport", n)
+    #     if self._proc is None:
+    #         raise server.TransportClosedError()
+
+    #     fd = self._proc.stdout.fileno()
+    #     end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
+
+    #     try:
+    #         self._await_ready([fd], [], end_time=end_time)
+    #         to_return = os.read(fd, n)
+    #     except BrokenPipeError:
+    #         to_return = 0
+
+    #     if not to_return:
+    #         self.close_transport()
+    #         raise server.TransportClosedError()
+    #     print("ret", to_return)
+
+    #     return to_return
+
+    # def write_transport(self, data, timeout_sec):
+    #     print("write_transport", data)
+    #     if self._proc is None:
+    #         raise server.TransportClosedError()
+
+    #     fd = self._proc.stdin.fileno()
+    #     end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
+
+    #     # data_len = len(data)
+    #     while data:
+    #         self._await_ready([], [fd], end_time=end_time)
+    #         try:
+    #             num_written = os.write(fd, data)
+    #         except BrokenPipeError:
+    #             num_written = 0
+
+    #         if not num_written:
+    #             self.disconnect_transport()
+    #             raise server.TransportClosedError()
+
+    #         data = data[num_written:]
+
     def read_transport(self, n, timeout_sec):
-        # print("read_transport", n)
-        if self._proc is None:
-            raise server.TransportClosedError()
-
-        fd = self._proc.stdout.fileno()
-        end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
-
-        try:
-            self._await_ready([fd], [], end_time=end_time)
-            to_return = os.read(fd, n)
-        except BrokenPipeError:
-            to_return = 0
-
-        if not to_return:
-            self.close_transport()
-            raise server.TransportClosedError()
-        # print("ret", to_return)
-
-        return to_return
+        return server.read_with_timeout(self.read_fd, n, timeout_sec)
 
     def write_transport(self, data, timeout_sec):
-        # print("write_transport", data)
-        if self._proc is None:
-            raise server.TransportClosedError()
+        to_write = bytearray()
+        escape_pos = []
+        for i, b in enumerate(data):
+            # if b == 0x01:
+            #     to_write.append(b)
+            #     escape_pos.append(i)
+            to_write.append(b)
 
-        fd = self._proc.stdin.fileno()
-        end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
-
-        # data_len = len(data)
-        while data:
-            self._await_ready([], [fd], end_time=end_time)
-            try:
-                num_written = os.write(fd, data)
-            except BrokenPipeError:
-                num_written = 0
-
-            if not num_written:
-                self.disconnect_transport()
-                raise server.TransportClosedError()
-
-            data = data[num_written:]
+        while to_write:
+            num_written = server.write_with_timeout(self.write_fd, to_write, timeout_sec)
+            to_write = to_write[num_written:]
 
 
 if __name__ == "__main__":
